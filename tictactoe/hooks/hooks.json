@@ -1,0 +1,6 @@
+{
+  "description": "Tic-tac-toe above the prompt: /tictactoe mounts the board surface module in the AbovePrompt band, keeps score and difficulty, and tells the board when Claude finishes a turn",
+  "modules": [
+    "./register.tsx"
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "name": "tictactoe",
+  "version": "0.1.0",
+  "description": "Tic-tac-toe in a pane: /tictactoe opens a board beside the transcript where you play X against Claude's O, with a difficulty toggle and a score kept across sessions."
+}
