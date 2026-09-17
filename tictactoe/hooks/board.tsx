@@ -2,6 +2,8 @@
 import type { ClientElements, ClientSurface } from 'claude-code'
 
 import * as Game from './game.ts'
+import type { View } from './kitty/paint.ts'
+import { idColorOf, placeholderRow } from './kitty/terminal.ts'
 
 // A surface module: it runs on the drawing thread with its own state, frame clock, mouse, and
 // keys (once a click gives it focus; Esc gives them back to the prompt). The hooks module hands it
@@ -18,7 +20,13 @@ export type Props = {
   done: number
   /** One text row per cell instead of three, for a short band. */
   compact: boolean
+  /** Set when the board draws as a kitty image: its id and the cell box it fills. */
+  kitty: Kitty | null
+  /** The last event sequence number the hooks module has applied. */
+  ack: number
 }
+
+export type Kitty = { id: number; columns: number; rows: number; cellWidth: number; cellHeight: number }
 
 type State = {
   round: number
@@ -31,12 +39,32 @@ type State = {
   frame: number
   isClaudeDone: boolean
   compact: boolean
+  kitty: Kitty | null
+  /** The mark scaling in, and how many ticks along. */
+  placing: { index: number; step: number } | null
+  /** How many ticks the win line has been drawing. */
+  winStep: number
+  /** What goes to the hooks module, mutated in place so queueing needs no redraw. */
+  outbox: Outbox
 }
 
-export type Post = { kind: 'result'; outcome: 'won' | 'lost' | 'draw' } | { kind: 'toggle-difficulty' }
+/**
+ * Events wait here until the hooks module acknowledges them (props.ack): a
+ * later post in the same frame replaces an undelivered one, so every post
+ * carries all the events not yet acknowledged, and the latest view.
+ */
+type Outbox = { key: string; seq: number; events: Event[] }
 
-const TICK_MS = 120
-const THINK_TICKS = 4
+export type Event =
+  | { seq: number; type: 'result'; outcome: 'won' | 'lost' | 'draw' }
+  | { seq: number; type: 'toggle-difficulty' }
+
+export type Post = { kind: 'sync'; view: View | null; events: Event[] }
+
+const TICK_MS = 50
+const THINK_TICKS = 9
+const PLACE_STEPS = 5
+const WIN_STEPS = 6
 
 const X_COLOR = 'cyanBright'
 const O_COLOR = '#d97757'
@@ -63,17 +91,38 @@ const CURSOR_KEYS: Record<string, readonly [number, number]> = {
 }
 
 /** A new board, keeping what the props last said (round, difficulty, turns seen). */
-const fresh = (from: Pick<State, 'round' | 'difficulty' | 'seenDone' | 'compact'>, cursor = 4): State => ({
+type Kept = Pick<State, 'round' | 'difficulty' | 'seenDone' | 'compact' | 'kitty'>
+
+const keptOf = (props: Props): Kept => ({
+  round: props.round,
+  difficulty: props.difficulty,
+  seenDone: props.done,
+  compact: props.compact,
+  kitty: props.kitty,
+})
+
+const fresh = (from: Kept, cursor = 4, outbox: Outbox = { key: '', seq: 0, events: [] }): State => ({
   round: from.round,
   difficulty: from.difficulty,
   seenDone: from.seenDone,
   compact: from.compact,
+  kitty: from.kitty,
+  placing: null,
+  winStep: 0,
+  outbox,
   board: Game.EMPTY_BOARD,
   cursor,
   thinking: null,
   frame: 0,
   isClaudeDone: false,
 })
+
+type Queued = Event extends infer E ? (E extends Event ? Omit<E, 'seq'> : never) : never
+
+function queue(outbox: Outbox, event: Queued) {
+  outbox.seq += 1
+  outbox.events.push({ ...event, seq: outbox.seq } as Event)
+}
 
 function resultOf(outcome: Game.Outcome): 'won' | 'lost' | 'draw' | null {
   switch (outcome.kind) {
@@ -95,7 +144,7 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
     const after = resultOf(Game.outcomeOf(next.board))
 
     if (after && !before) {
-      surface.post({ kind: 'result', outcome: after })
+      queue(next.outbox, { type: 'result', outcome: after })
     }
 
     surface.setState(next)
@@ -109,7 +158,7 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
     }
 
     if (Game.outcomeOf(s.board).kind !== 'playing') {
-      update(fresh(s, index))
+      update(fresh(s, index, s.outbox))
       return
     }
 
@@ -120,16 +169,40 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
     const board = Game.played(s.board, index, Game.PERSON)
     const isOver = Game.outcomeOf(board).kind !== 'playing'
 
-    update({ ...s, board, cursor: index, isClaudeDone: false, thinking: isOver ? null : THINK_TICKS })
+    update({
+      ...s,
+      board,
+      cursor: index,
+      isClaudeDone: false,
+      placing: { index, step: 0 },
+      thinking: isOver ? null : THINK_TICKS,
+    })
   }
 
   if (surface.state === undefined) {
-    surface.setState(fresh({ round: props.round, difficulty: props.difficulty, seenDone: props.done, compact: props.compact }))
+    surface.setState(fresh(keptOf(props)))
 
     surface.every(TICK_MS, () => {
       const s = surface.state
 
-      if (!s || s.thinking === null) {
+      if (!s) {
+        return
+      }
+
+      const isPlacing = s.placing !== null && s.placing.step < PLACE_STEPS
+      const isWinDrawing = !isPlacing && Game.outcomeOf(s.board).kind === 'won' && s.winStep < WIN_STEPS
+
+      if (isPlacing && s.placing) {
+        surface.setState({ ...s, placing: { ...s.placing, step: s.placing.step + 1 } })
+        return
+      }
+
+      if (isWinDrawing) {
+        surface.setState({ ...s, winStep: s.winStep + 1 })
+        return
+      }
+
+      if (s.thinking === null) {
         return
       }
 
@@ -141,22 +214,16 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
       const move = Game.claudeMoveOf(s.board, s.difficulty)
       const board = move === null ? s.board : Game.played(s.board, move, Game.CLAUDE)
 
-      update({ ...s, board, thinking: null })
+      update({ ...s, board, thinking: null, placing: move === null ? s.placing : { index: move, step: 0 } })
     })
 
     surface.onPointer(event => {
       const s = surface.state
-      const layout = s?.compact ? COMPACT : FULL
-      const col = Math.floor(event.x / (layout.w + 1))
-      const row = Math.floor(event.y / (layout.h + 1))
-      const isOnBorder = event.x % (layout.w + 1) === 0 || event.y % (layout.h + 1) === 0
-      const isInside = col >= 0 && col < 3 && row >= 0 && row < 3 && !isOnBorder
+      const index = s ? cellAt(s, event.x, event.y) : null
 
-      if (!s || !isInside) {
+      if (!s || index === null) {
         return
       }
-
-      const index = row * 3 + col
 
       if (event.type === 'down' && event.button === 'left') {
         play(index)
@@ -185,26 +252,27 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
       } else if (/^[1-9]$/.test(k)) {
         play(Number(k) - 1)
       } else if (k === 'r' || k === 'n') {
-        update(fresh(s, s.cursor))
+        update(fresh(s, s.cursor, s.outbox))
       } else if (k === 'x') {
-        surface.post({ kind: 'toggle-difficulty' })
+        queue(s.outbox, { type: 'toggle-difficulty' })
+        surface.setState({ ...s })
       }
     })
   }
 
   // The listeners above only read surface.state, so new props are folded into it here:
   // a new round starts a fresh board, a new difficulty applies to Claude's next move.
-  let s = surface.state ?? fresh({ round: props.round, difficulty: props.difficulty, seenDone: props.done, compact: props.compact })
+  let s = surface.state ?? fresh(keptOf(props))
+
+  const isNewKitty = JSON.stringify(props.kitty) !== JSON.stringify(s.kitty)
 
   if (props.round !== s.round) {
-    s = fresh({ round: props.round, difficulty: props.difficulty, seenDone: props.done, compact: props.compact }, s.cursor)
+    s = fresh(keptOf(props), s.cursor, s.outbox)
     surface.setState(s)
-  } else if (props.difficulty !== s.difficulty || props.done !== s.seenDone || props.compact !== s.compact) {
+  } else if (props.difficulty !== s.difficulty || props.done !== s.seenDone || props.compact !== s.compact || isNewKitty) {
     s = {
       ...s,
-      difficulty: props.difficulty,
-      seenDone: props.done,
-      compact: props.compact,
+      ...keptOf(props),
       isClaudeDone: s.isClaudeDone || props.done !== s.seenDone,
     }
     surface.setState(s)
@@ -219,8 +287,41 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
     : outcome.kind === 'draw' ? 'yellow'
     : 'gray'
 
+  const cursor = isPlaying && s.thinking === null ? s.cursor : null
+
+  const view: View | null = props.kitty && {
+      board: [...s.board],
+      cursor,
+      placing: s.placing && s.placing.step < PLACE_STEPS ? { index: s.placing.index, t: s.placing.step / PLACE_STEPS } : null,
+      win: outcome.kind === 'won' ? { line: [...outcome.line], t: s.winStep / WIN_STEPS } : null,
+      isDraw: outcome.kind === 'draw',
+    }
+  const key = JSON.stringify([view, props.kitty])
+  const { outbox } = s
+
+  outbox.events = outbox.events.filter(event => event.seq > props.ack)
+
+  if (key !== outbox.key || outbox.events.length > 0) {
+    outbox.key = key
+    surface.post({ kind: 'sync', view, events: outbox.events })
+  }
+
+  if (props.kitty) {
+    const color = idColorOf(props.kitty.id)
+    const rows = Array.from({ length: props.kitty.rows }, (_, row) => (
+      <Text color={color}>{placeholderRow(row, props.kitty?.columns ?? 1)}</Text>
+    ))
+
+    return (
+      <Box flexDirection="row" columnGap={3}>
+        <Box flexDirection="column">{rows}</Box>
+        {sidePanel(Text, Box, props, s, outcome)}
+      </Box>
+    )
+  }
+
   const lines = boardLines(layout, s.board, {
-    cursor: isPlaying && s.thinking === null ? s.cursor : null,
+    cursor,
     winLine,
     isOver: !isPlaying,
     borderColor,
@@ -234,6 +335,36 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
       {sidePanel(Text, Box, props, s, outcome)}
     </Box>
   )
+}
+
+/**
+ * The board cell under a pointer position in the region, or null: in kitty
+ * mode by the image's pixel geometry, else by the text grid's borders.
+ */
+function cellAt(s: State, x: number, y: number): number | null {
+  let col: number
+  let row: number
+
+  if (s.kitty) {
+    const { columns, rows, cellWidth, cellHeight } = s.kitty
+    const side = Math.min(columns * cellWidth, rows * cellHeight)
+    const px = (x + 0.5) * cellWidth - (columns * cellWidth - side) / 2
+    const py = (y + 0.5) * cellHeight - (rows * cellHeight - side) / 2
+
+    col = Math.floor((px / side) * 3)
+    row = Math.floor((py / side) * 3)
+  } else {
+    const layout = s.compact ? COMPACT : FULL
+
+    if (x % (layout.w + 1) === 0 || y % (layout.h + 1) === 0) {
+      return null
+    }
+
+    col = Math.floor(x / (layout.w + 1))
+    row = Math.floor(y / (layout.h + 1))
+  }
+
+  return col >= 0 && col < 3 && row >= 0 && row < 3 ? row * 3 + col : null
 }
 
 function boardLines(
@@ -308,7 +439,7 @@ function sidePanel(
   s: State,
   outcome: Game.Outcome,
 ) {
-  const dots = '.'.repeat((s.frame % 3) + 1).padEnd(3)
+  const dots = '.'.repeat((Math.floor(s.frame / 3) % 3) + 1).padEnd(3)
   const status =
     s.thinking !== null ? <Text color={O_COLOR}>{`◯ Claude is thinking${dots}`}</Text>
     : outcome.kind === 'won' && outcome.by === Game.PERSON ? <Text color="greenBright" bold>★ You win!</Text>
