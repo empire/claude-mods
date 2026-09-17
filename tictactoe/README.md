@@ -54,6 +54,9 @@ default) picks the image in Ghostty or kitty outside tmux. The choice is saved.
   click or Enter then starts the next game.
 - When Claude finishes a turn while the board is open, the board shows
   `● Claude finished its turn`.
+- **Menu**: `☰ menu` in the header opens a row with `reset score` (asks
+  before zeroing) and `board: image|text`, which switches renderers. It only
+  switches to the image where the terminal can show one; otherwise it says why.
 - The score and level are saved in the plugin's store and survive restarts.
 - When the band has fewer than 16 rows, the board switches to a compact
   layout with one text row per cell.

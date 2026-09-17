@@ -22,6 +22,8 @@ const KITTY_MAX_ROWS = 16
 const SIDE_PANEL_COLUMNS = 48
 
 type Renderer = 'auto' | 'kitty' | 'text'
+/** The header's menu row: hidden, showing its items, or asking to confirm a score reset. */
+type Menu = 'closed' | 'open' | 'confirm-reset'
 type Cells = { cellWidth: number; cellHeight: number }
 
 const isPost = (data: unknown): data is Post =>
@@ -52,6 +54,7 @@ export function register(on: On) {
   let renderer: Renderer = 'auto'
   /** The board's last event applied; a board mounted fresh numbers its events from 1 again. */
   let ack = 0
+  let menu: Menu = 'closed'
 
   /** The terminal's cell size in pixels, once probed; null where kitty mode is off. */
   let cells: Cells | null = null
@@ -65,6 +68,8 @@ export function register(on: On) {
   /** Paints and uploads frames one at a time; frames that arrive meanwhile collapse into the latest. */
   let pumpUploads: () => Promise<void> = async () => undefined
   let deleteImage: () => Promise<void> = async () => undefined
+  /** Decides between the image and the text board for `renderer`, measuring the terminal. */
+  let setUpRenderer: () => Promise<void> = async () => undefined
 
   const boardProps = (): Props => ({ round, difficulty, score, done: turnsDone, compact, kitty, ack })
 
@@ -122,6 +127,31 @@ export function register(on: On) {
       }
     }
 
+    setUpRenderer = async () => {
+      // Kitty mode needs the protocol, a real terminal (tmux keeps the images to itself) and
+      // python3 to reach it; `/tictactoe kitty` skips the terminal check, `text` turns it off.
+      const orEmpty = async (value: Promise<string | undefined>) => (await value.catch(() => undefined)) ?? ''
+      const [term, program, tmux, kittyWindow] = await Promise.all([
+        orEmpty($.env.get('TERM')),
+        orEmpty($.env.get('TERM_PROGRAM')),
+        orEmpty($.env.get('TMUX')),
+        orEmpty($.env.get('KITTY_WINDOW_ID')),
+      ])
+      const isKittyTerminal =
+        tmux === '' && (program === 'ghostty' || term === 'xterm-kitty' || term === 'xterm-ghostty' || kittyWindow !== '')
+
+      cells = null
+
+      if (renderer === 'kitty' || (renderer === 'auto' && isKittyTerminal)) {
+        const probe = await $.process.run(['python3', '-c', Terminal.PROBE_PY]).catch(() => null)
+        const [rows = 0, columns = 0, xPixels = 0, yPixels = 0] = (probe?.stdout ?? '').trim().split(/\s+/).map(Number)
+
+        if (probe?.exitCode === 0 && rows > 0 && columns > 0 && xPixels > 0 && yPixels > 0) {
+          cells = { cellWidth: xPixels / columns, cellHeight: yPixels / rows }
+        }
+      }
+    }
+
     await $.command
       .register({
         name: COMMAND,
@@ -150,28 +180,7 @@ export function register(on: On) {
       return { text: 'Tic-tac-toe closed' }
     }
 
-    // Kitty mode needs the protocol, a real terminal (tmux keeps the images to itself) and
-    // python3 to reach it; `/tictactoe kitty` skips the terminal check, `text` turns it off.
-    const orEmpty = async (value: Promise<string | undefined>) => (await value.catch(() => undefined)) ?? ''
-    const [term, program, tmux, kittyWindow] = await Promise.all([
-      orEmpty($.env.get('TERM')),
-      orEmpty($.env.get('TERM_PROGRAM')),
-      orEmpty($.env.get('TMUX')),
-      orEmpty($.env.get('KITTY_WINDOW_ID')),
-    ])
-    const isKittyTerminal =
-      tmux === '' && (program === 'ghostty' || term === 'xterm-kitty' || term === 'xterm-ghostty' || kittyWindow !== '')
-
-    cells = null
-
-    if (renderer === 'kitty' || (renderer === 'auto' && isKittyTerminal)) {
-      const probe = await $.process.run(['python3', '-c', Terminal.PROBE_PY]).catch(() => null)
-      const [rows = 0, columns = 0, xPixels = 0, yPixels = 0] = (probe?.stdout ?? '').trim().split(/\s+/).map(Number)
-
-      if (probe?.exitCode === 0 && rows > 0 && columns > 0 && xPixels > 0 && yPixels > 0) {
-        cells = { cellWidth: xPixels / columns, cellHeight: yPixels / rows }
-      }
-    }
+    await setUpRenderer()
 
     isOpen = true
     ack = 0
@@ -271,9 +280,61 @@ export function register(on: On) {
 
     const close = () => {
       isOpen = false
+      menu = 'closed'
       $.ui.invalidate('ui.render')
       void deleteImage()
     }
+
+    const setMenu = (shown: Menu) => {
+      menu = shown
+      $.ui.invalidate('ui.render')
+    }
+
+    const resetScore = () => {
+      score = Game.EMPTY_SCORE
+      menu = 'closed'
+      void $.store.set(SCORE_KEY, score).catch(() => undefined)
+      $.ui.toast('tic-tac-toe: score reset')
+      $.ui.invalidate('ui.render')
+    }
+
+    // Image to text frees the image. Text to image switches back to automatic detection, and
+    // stays on text with a note where the terminal cannot show images.
+    const toggleRenderer = async () => {
+      const wasImage = cells !== null
+
+      if (wasImage) {
+        await deleteImage()
+      }
+
+      renderer = wasImage ? 'text' : 'auto'
+      await setUpRenderer()
+
+      if (!wasImage && !cells) {
+        renderer = 'text'
+        $.ui.toast('tic-tac-toe: no kitty graphics here (needs Ghostty or kitty outside tmux, and python3)')
+      }
+
+      await $.store.set(RENDERER_KEY, renderer).catch(() => undefined)
+      $.ui.invalidate('ui.render')
+    }
+
+    const { wins, losses, draws } = score
+
+    const menuRow =
+      menu === 'open' ? (
+        <Box flexDirection="row" columnGap={1}>
+          <Text dimColor>{'  menu ›'}</Text>
+          <Button key="ttt:menu:reset" label="reset score" onPress={() => setMenu('confirm-reset')} />
+          <Button key="ttt:menu:board" label={`board: ${cells ? 'image' : 'text'}`} onPress={() => void toggleRenderer()} />
+        </Box>
+      ) : menu === 'confirm-reset' ? (
+        <Box flexDirection="row" columnGap={1}>
+          <Text color="yellow">{`  reset won ${wins} · lost ${losses} · drawn ${draws} to zero?`}</Text>
+          <Button key="ttt:menu:reset-yes" label="yes, reset" onPress={resetScore} />
+          <Button key="ttt:menu:reset-no" label="cancel" dimColor onPress={() => setMenu('open')} />
+        </Box>
+      ) : null
 
     // No hotkeys: a band hotkey would fire on a digit typed as a prompt's first character.
     return (
@@ -282,8 +343,14 @@ export function register(on: On) {
           <Text color="#d97757" bold>▦ tic-tac-toe</Text>
           <Button key="ttt:new" label="new game" onPress={newGame} />
           <Button key="ttt:level" label={`level: ${difficulty}`} onPress={toggleDifficulty} />
+          <Button
+            key="ttt:menu"
+            label={menu === 'closed' ? '☰ menu' : '✕ menu'}
+            onPress={() => setMenu(menu === 'closed' ? 'open' : 'closed')}
+          />
           <Button key="ttt:close" label="close" dimColor onPress={close} />
         </Box>
+        {menuRow}
         <Client
           key="ttt:board"
           module="./board.tsx"
