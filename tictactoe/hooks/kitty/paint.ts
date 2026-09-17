@@ -13,6 +13,8 @@ export type View = {
   /** The winning line and how much of it is drawn (0..1). */
   win: { line: number[]; t: number } | null
   isDraw: boolean
+  /** Shaded dark while a menu is open over the board. */
+  isDimmed: boolean
 }
 
 /** The image's size in pixels and where the square board sits inside it. */
@@ -222,6 +224,14 @@ export function paint(view: View, canvas: Canvas): Uint8Array {
       clipped(i, O_TO, Math.exp(-Math.max(d, 0) / glow) * 0.35 * alpha)
       clipped(i, color, coverage(d) * alpha)
     })
+  }
+
+  if (view.isDimmed) {
+    for (let k = 0; k < px.length; k += 4) {
+      px[k] = (px[k] ?? 0) * 0.4
+      px[k + 1] = (px[k + 1] ?? 0) * 0.4
+      px[k + 2] = (px[k + 2] ?? 0) * 0.4
+    }
   }
 
   const out = new Uint8Array(width * height * 4)

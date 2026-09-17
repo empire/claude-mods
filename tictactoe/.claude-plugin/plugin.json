@@ -1,5 +1,5 @@
 {
   "name": "tictactoe",
-  "version": "0.1.0",
-  "description": "Tic-tac-toe in a pane: /tictactoe opens a board beside the transcript where you play X against Claude's O, with a difficulty toggle and a score kept across sessions."
+  "version": "0.2.0",
+  "description": "Tic-tac-toe against Claude above the prompt: a painted kitty-graphics board in Ghostty and kitty (text board elsewhere), an app-style menu bar, and a scoreboard with win rate, streaks and recent results. Needs CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1."
 }

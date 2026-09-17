@@ -5,25 +5,32 @@ import type { Kitty, Post, Props } from './board.tsx'
 import * as Game from './game.ts'
 import { canvasOf, paint, type View } from './kitty/paint.ts'
 import * as Terminal from './kitty/terminal.ts'
+import type { Result } from './ui/scoreboard.ts'
+import * as Scoreboard from './ui/scoreboard.ts'
 
 const COMMAND = 'tictactoe'
 const SCORE_KEY = 'score'
+const HISTORY_KEY = 'history'
 const DIFFICULTY_KEY = 'difficulty'
 const RENDERER_KEY = 'renderer'
 
-/** Below this many band rows the text board draws one text row per cell. */
-const FULL_BOARD_MIN_ROWS = 16
+/** How many finished games the history keeps, for the streak and the recent row. */
+const HISTORY_LIMIT = 20
+
+/** Rows the menu bar and the blank row under it take above the board. */
+const HEADER_ROWS = 2
+
+/** The text board's full height; with fewer rows left, the band goes compact. */
+const FULL_BOARD_ROWS = 13
 
 /** The kitty board's height in rows: as tall as the band allows, within these. */
-const KITTY_MIN_ROWS = 6
+const KITTY_MIN_ROWS = 4
 const KITTY_MAX_ROWS = 16
 
-/** Columns the side panel beside the board needs. */
-const SIDE_PANEL_COLUMNS = 48
+/** Columns the scoreboard and the gap before it take beside the board. */
+const SCOREBOARD_COLUMNS = Scoreboard.WIDTH + 3
 
 type Renderer = 'auto' | 'kitty' | 'text'
-/** The header's menu row: hidden, showing its items, or asking to confirm a score reset. */
-type Menu = 'closed' | 'open' | 'confirm-reset'
 type Cells = { cellWidth: number; cellHeight: number }
 
 const isPost = (data: unknown): data is Post =>
@@ -32,29 +39,35 @@ const isPost = (data: unknown): data is Post =>
 const rendererOf = (value: unknown): Renderer =>
   value === 'kitty' || value === 'text' ? value : 'auto'
 
+const historyOf = (value: unknown): Result[] =>
+  Array.isArray(value)
+    ? value.filter((item): item is Result => item === 'won' || item === 'lost' || item === 'draw').slice(-HISTORY_LIMIT)
+    : []
+
 /**
  * Registers `/tictactoe`: a board in the band above the prompt, where the
  * person plays X against Claude's O while Claude works.
  *
- * The board is a surface module (`./board.tsx`) with its own keys, mouse and
- * clock. This module mounts it, keeps the score and difficulty in the store,
- * and tells the board when Claude finishes a turn. In a terminal with the
- * kitty graphics protocol it also paints each frame the board posts and
- * uploads it as an image (see `./kitty/terminal.ts`).
+ * The board is a surface module (`./board.tsx`) that draws the whole band
+ * body (menu bar, board, scoreboard, menus) and takes the mouse and keys.
+ * This module mounts it, keeps the score, history and settings in the store,
+ * does what its menus ask, and tells it when Claude finishes a turn. In a
+ * terminal with the kitty graphics protocol it also paints each frame the
+ * board posts and uploads it as an image (see `./kitty/terminal.ts`).
  *
  * @param on the engine's registrar
  */
 export function register(on: On) {
   let isOpen = false
-  let round = 0
   let turnsDone = 0
   let difficulty: Game.Difficulty = 'hard'
   let score: Game.Score = Game.EMPTY_SCORE
+  let history: Result[] = []
   let compact = false
+  let columns = 80
   let renderer: Renderer = 'auto'
   /** The board's last event applied; a board mounted fresh numbers its events from 1 again. */
   let ack = 0
-  let menu: Menu = 'closed'
 
   /** The terminal's cell size in pixels, once probed; null where kitty mode is off. */
   let cells: Cells | null = null
@@ -71,18 +84,20 @@ export function register(on: On) {
   /** Decides between the image and the text board for `renderer`, measuring the terminal. */
   let setUpRenderer: () => Promise<void> = async () => undefined
 
-  const boardProps = (): Props => ({ round, difficulty, score, done: turnsDone, compact, kitty, ack })
+  const boardProps = (): Props => ({ difficulty, score, history, done: turnsDone, compact, kitty, ack, columns })
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
 
-    const [storedScore, storedDifficulty, storedRenderer] = await Promise.all([
+    const [storedScore, storedHistory, storedDifficulty, storedRenderer] = await Promise.all([
       $.store.get(SCORE_KEY).catch(() => undefined),
+      $.store.get(HISTORY_KEY).catch(() => undefined),
       $.store.get(DIFFICULTY_KEY).catch(() => undefined),
       $.store.get(RENDERER_KEY).catch(() => undefined),
     ])
 
     score = Game.scoreOf(storedScore)
+    history = historyOf(storedHistory)
     difficulty = storedDifficulty === 'easy' ? 'easy' : 'hard'
     renderer = rendererOf(storedRenderer)
 
@@ -144,10 +159,10 @@ export function register(on: On) {
 
       if (renderer === 'kitty' || (renderer === 'auto' && isKittyTerminal)) {
         const probe = await $.process.run(['python3', '-c', Terminal.PROBE_PY]).catch(() => null)
-        const [rows = 0, columns = 0, xPixels = 0, yPixels = 0] = (probe?.stdout ?? '').trim().split(/\s+/).map(Number)
+        const [rows = 0, cols = 0, xPixels = 0, yPixels = 0] = (probe?.stdout ?? '').trim().split(/\s+/).map(Number)
 
-        if (probe?.exitCode === 0 && rows > 0 && columns > 0 && xPixels > 0 && yPixels > 0) {
-          cells = { cellWidth: xPixels / columns, cellHeight: yPixels / rows }
+        if (probe?.exitCode === 0 && rows > 0 && cols > 0 && xPixels > 0 && yPixels > 0) {
+          cells = { cellWidth: xPixels / cols, cellHeight: yPixels / rows }
         }
       }
     }
@@ -189,7 +204,7 @@ export function register(on: On) {
     const how = cells ? 'kitty graphics' : renderer === 'text' ? 'text' : 'text (no kitty graphics here)'
 
     return {
-      text: `Tic-tac-toe · ${how} · click the board to play · Esc returns to the prompt · /tictactoe closes`,
+      text: `Tic-tac-toe · ${how} · click the board to play · m opens the menu · /tictactoe closes`,
     }
   })
 
@@ -227,19 +242,61 @@ export function register(on: On) {
 
       ack = event.seq
 
-      if (event.type === 'toggle-difficulty') {
-        difficulty = difficulty === 'hard' ? 'easy' : 'hard'
-        await $.store.set(DIFFICULTY_KEY, difficulty).catch(() => undefined)
-        $.ui.invalidate('ui.render')
-      } else {
-        const outcome: Game.Outcome =
-          event.outcome === 'draw' ? { kind: 'draw' }
-          : { kind: 'won', by: event.outcome === 'won' ? Game.PERSON : Game.CLAUDE, line: [] }
+      switch (event.type) {
+        case 'result': {
+          const outcome: Game.Outcome =
+            event.outcome === 'draw' ? { kind: 'draw' }
+            : { kind: 'won', by: event.outcome === 'won' ? Game.PERSON : Game.CLAUDE, line: [] }
 
-        score = Game.scoredAfter(score, outcome)
-        await $.store.set(SCORE_KEY, score).catch(() => undefined)
+          score = Game.scoredAfter(score, outcome)
+          history = [...history, event.outcome].slice(-HISTORY_LIMIT)
+          await $.store.set(SCORE_KEY, score).catch(() => undefined)
+          await $.store.set(HISTORY_KEY, history).catch(() => undefined)
+          break
+        }
+        case 'reset-score':
+          score = Game.EMPTY_SCORE
+          history = []
+          await $.store.set(SCORE_KEY, score).catch(() => undefined)
+          await $.store.set(HISTORY_KEY, history).catch(() => undefined)
+          $.ui.toast('tic-tac-toe: scoreboard reset')
+          break
+        case 'set-difficulty':
+          difficulty = event.difficulty
+          await $.store.set(DIFFICULTY_KEY, difficulty).catch(() => undefined)
+          break
+        case 'set-image-board': {
+          // Image to text frees the image. Text to image goes back to automatic detection, and
+          // stays on text with a note where the terminal cannot show images.
+          const wasImage = cells !== null
+
+          if (event.isImage === wasImage) {
+            break
+          }
+
+          if (wasImage) {
+            await deleteImage()
+          }
+
+          renderer = event.isImage ? 'auto' : 'text'
+          await setUpRenderer()
+
+          if (event.isImage && !cells) {
+            renderer = 'text'
+            $.ui.toast('tic-tac-toe: no kitty graphics here (needs Ghostty or kitty outside tmux, and python3)')
+          }
+
+          await $.store.set(RENDERER_KEY, renderer).catch(() => undefined)
+          break
+        }
+        case 'close':
+          isOpen = false
+          await deleteImage()
+          break
       }
     }
+
+    $.ui.invalidate('ui.render')
 
     return { props: boardProps() }
   })
@@ -250,113 +307,29 @@ export function register(on: On) {
       return next(e)
     }
 
-    const { Box, Button, Client, Text } = await $.ui.resolve(e)
-    compact = e.props.maxRows < FULL_BOARD_MIN_ROWS
+    const { Box, Client } = await $.ui.resolve(e)
+    const boardRows = e.props.maxRows - HEADER_ROWS
+
+    columns = e.props.bodyColumns
+    compact = boardRows < FULL_BOARD_ROWS
 
     if (cells) {
       // A square board: as many rows as the band spares, as many columns as make it square,
-      // fewer rows when the band is too narrow for that beside the side panel.
-      const room = Math.max(10, e.props.bodyColumns - SIDE_PANEL_COLUMNS)
-      const byHeight = Math.min(KITTY_MAX_ROWS, Terminal.MAX_ROWS, Math.max(KITTY_MIN_ROWS, e.props.maxRows - 3))
+      // fewer rows when the band is too narrow for that beside the scoreboard.
+      const room = Math.max(10, columns - SCOREBOARD_COLUMNS)
+      const byHeight = Math.min(KITTY_MAX_ROWS, Terminal.MAX_CELLS, Math.max(KITTY_MIN_ROWS, boardRows))
       const byWidth = Math.floor((room * cells.cellWidth) / cells.cellHeight)
       const rows = Math.max(3, Math.min(byHeight, byWidth))
-      const columns = Math.max(3, Math.round((rows * cells.cellHeight) / cells.cellWidth))
+      const cols = Math.max(3, Math.round((rows * cells.cellHeight) / cells.cellWidth))
 
-      kitty = { id: imageId, columns, rows, ...cells }
+      kitty = { id: imageId, columns: cols, rows, ...cells }
     } else {
       kitty = null
     }
 
-    const newGame = () => {
-      round += 1
-      $.ui.invalidate('ui.render')
-    }
-
-    const toggleDifficulty = () => {
-      difficulty = difficulty === 'hard' ? 'easy' : 'hard'
-      void $.store.set(DIFFICULTY_KEY, difficulty).catch(() => undefined)
-      $.ui.invalidate('ui.render')
-    }
-
-    const close = () => {
-      isOpen = false
-      menu = 'closed'
-      $.ui.invalidate('ui.render')
-      void deleteImage()
-    }
-
-    const setMenu = (shown: Menu) => {
-      menu = shown
-      $.ui.invalidate('ui.render')
-    }
-
-    const resetScore = () => {
-      score = Game.EMPTY_SCORE
-      menu = 'closed'
-      void $.store.set(SCORE_KEY, score).catch(() => undefined)
-      $.ui.toast('tic-tac-toe: score reset')
-      $.ui.invalidate('ui.render')
-    }
-
-    // Image to text frees the image. Text to image switches back to automatic detection, and
-    // stays on text with a note where the terminal cannot show images.
-    const toggleRenderer = async () => {
-      const wasImage = cells !== null
-
-      if (wasImage) {
-        await deleteImage()
-      }
-
-      renderer = wasImage ? 'text' : 'auto'
-      await setUpRenderer()
-
-      if (!wasImage && !cells) {
-        renderer = 'text'
-        $.ui.toast('tic-tac-toe: no kitty graphics here (needs Ghostty or kitty outside tmux, and python3)')
-      }
-
-      await $.store.set(RENDERER_KEY, renderer).catch(() => undefined)
-      $.ui.invalidate('ui.render')
-    }
-
-    const { wins, losses, draws } = score
-
-    const menuRow =
-      menu === 'open' ? (
-        <Box flexDirection="row" columnGap={1}>
-          <Text dimColor>{'  menu ›'}</Text>
-          <Button key="ttt:menu:reset" label="reset score" onPress={() => setMenu('confirm-reset')} />
-          <Button key="ttt:menu:board" label={`board: ${cells ? 'image' : 'text'}`} onPress={() => void toggleRenderer()} />
-        </Box>
-      ) : menu === 'confirm-reset' ? (
-        <Box flexDirection="row" columnGap={1}>
-          <Text color="yellow">{`  reset won ${wins} · lost ${losses} · drawn ${draws} to zero?`}</Text>
-          <Button key="ttt:menu:reset-yes" label="yes, reset" onPress={resetScore} />
-          <Button key="ttt:menu:reset-no" label="cancel" dimColor onPress={() => setMenu('open')} />
-        </Box>
-      ) : null
-
-    // No hotkeys: a band hotkey would fire on a digit typed as a prompt's first character.
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row" columnGap={1}>
-          <Text color="#d97757" bold>▦ tic-tac-toe</Text>
-          <Button key="ttt:new" label="new game" onPress={newGame} />
-          <Button key="ttt:level" label={`level: ${difficulty}`} onPress={toggleDifficulty} />
-          <Button
-            key="ttt:menu"
-            label={menu === 'closed' ? '☰ menu' : '✕ menu'}
-            onPress={() => setMenu(menu === 'closed' ? 'open' : 'closed')}
-          />
-          <Button key="ttt:close" label="close" dimColor onPress={close} />
-        </Box>
-        {menuRow}
-        <Client
-          key="ttt:board"
-          module="./board.tsx"
-          width={e.props.bodyColumns}
-          props={boardProps()}
-        />
+        <Client key="ttt:board" module="./board.tsx" width={columns} props={boardProps()} />
         {await next(e)}
       </Box>
     )
