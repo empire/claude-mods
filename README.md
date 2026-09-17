@@ -21,6 +21,8 @@ scoreboard.
 - A perfect Hard opponent (minimax) and a beatable Easy one
 - Mouse and keyboard play, saved progress, and no tokens spent
 
+![The same Claude Code session with the Level menu open over the game: the board dims beneath it and Hard is highlighted under the pointer](tictactoe/docs/menu.png)
+
 ```sh
 CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ./tictactoe
 ```
