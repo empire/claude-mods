@@ -3,7 +3,6 @@ import type { ClientSurface } from 'claude-code'
 
 import * as Game from './game.ts'
 import type { View } from './kitty/paint.ts'
-import { idColorOf, placeholderCell } from './kitty/terminal.ts'
 import * as Menus from './ui/menus.ts'
 import * as Scoreboard from './ui/scoreboard.ts'
 import { elementsOf, putCell, screenOf } from './ui/screen.tsx'
@@ -12,7 +11,9 @@ import * as TextBoard from './ui/text-board.ts'
 // A surface module: it runs on the drawing thread with its own state, frame clock, mouse, and
 // keys (once a click gives it focus; Esc gives them back to the prompt). It draws the whole band
 // body as one cell grid (the menu bar, the board, the scoreboard, and any open menu over them) and
-// tells the hooks module what to keep or do through `surface.post`.
+// tells the hooks module what to keep or do through `surface.post`. The image board is the one
+// thing it cannot draw (a surface module has no `Image`): it leaves the board's cells as a gap,
+// and the hooks module draws the picture beneath them from the frames this module posts.
 //
 // Never name a local `h` here: every JSX tag compiles to a call of `h`.
 
@@ -25,7 +26,7 @@ export type Props = {
   done: number
   /** A short band: one text row per board cell, and the compact scoreboard. */
   compact: boolean
-  /** Set when the board draws as a kitty image: its id and the cell box it fills. */
+  /** Set when the board draws as an image: the cell box it fills and a cell's size in pixels. */
   kitty: Kitty | null
   /** The last event sequence number the hooks module has applied. */
   ack: number
@@ -33,7 +34,7 @@ export type Props = {
   columns: number
 }
 
-export type Kitty = { id: number; columns: number; rows: number; cellWidth: number; cellHeight: number }
+export type Kitty = { columns: number; rows: number; cellWidth: number; cellHeight: number }
 
 type MenuState = {
   open: Menus.MenuName | null
@@ -172,6 +173,17 @@ function cellAt(s: State, x: number, y: number): number | null {
   const row = Math.floor((py / side) * 3)
 
   return col >= 0 && col < 3 && row >= 0 && row < 3 ? row * 3 + col : null
+}
+
+/** The open dropdown's box, which the menu draws over the board and its shadow. */
+function overlayOf(s: State): string | null {
+  if (!s.menu.open) {
+    return null
+  }
+
+  const { x, y, width, height } = dropdownOf(s, s.menu.open)
+
+  return `${x},${y},${width},${height}`
 }
 
 const titleAt = (x: number) => Menus.titleSpans().find(span => x >= span.x && x < span.x + span.width)?.name ?? null
@@ -438,6 +450,7 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
     win: outcome.kind === 'won' ? { line: [...outcome.line], t: s.winStep / WIN_STEPS } : null,
     isDraw: outcome.kind === 'draw',
     isDimmed: s.menu.open !== null,
+    overlay: overlayOf(s),
   }
 
   const key = JSON.stringify([view, props.kitty])
@@ -460,11 +473,10 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
   Menus.drawBar(screen, s.menu.open, s.menu.hoverTitle)
 
   if (props.kitty) {
-    const color = idColorOf(props.kitty.id)
-
+    // Left undrawn: the hooks module draws the Image under this region, at the same place.
     for (let row = 0; row < props.kitty.rows; row++) {
       for (let col = 0; col < props.kitty.columns; col++) {
-        putCell(screen, col, BOARD_TOP + row, { ch: placeholderCell(row, col), fg: color, isImage: true })
+        putCell(screen, col, BOARD_TOP + row, { ch: ' ', isImage: true })
       }
     }
   } else {
@@ -502,5 +514,5 @@ export default function Board(props: Props, surface: ClientSurface<State>) {
     Menus.drawDropdown(screen, dropdown, s.menu.hover)
   }
 
-  return <Box flexDirection="column">{elementsOf(Text, screen)}</Box>
+  return <Box flexDirection="column">{elementsOf({ Box, Text }, screen)}</Box>
 }

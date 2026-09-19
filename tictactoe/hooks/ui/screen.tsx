@@ -5,10 +5,12 @@ import type { ClientElements, RenderElement } from 'claude-code'
 // cannot overlap, so anything drawn over something else (the menu over the board) is
 // composited here, cell by cell, and only the finished grid goes to the renderer.
 //
-// Every cell holds one width-1 character. A kitty placeholder cell is the one exception in
-// spelling (a character and its diacritics), still one cell wide.
+// Every cell holds one width-1 character, except an image cell: a gap the grid leaves undrawn so
+// the board's Image, which the hooks module draws beneath this module's region, shows through.
+// Anything drawn over an image cell (a menu) replaces it, so it paints over the picture.
 
 export type Style = { fg?: string; bg?: string; bold?: boolean; dim?: boolean }
+/** `isImage` marks a gap over the Image; its `ch` is never drawn. */
 export type Cell = Style & { ch: string; isImage?: boolean }
 export type Screen = { width: number; height: number; rows: Cell[][] }
 
@@ -77,31 +79,43 @@ export function center(screen: Screen, x: number, y: number, width: number, text
   put(screen, x + Math.max(0, Math.floor((width - length) / 2)), y, text, style)
 }
 
-const styleKeyOf = (cell: Cell) => `${cell.fg ?? ''}|${cell.bg ?? ''}|${cell.bold ? 1 : 0}|${cell.dim ? 1 : 0}`
+const styleKeyOf = (cell: Cell) =>
+  cell.isImage ? 'image' : `${cell.fg ?? ''}|${cell.bg ?? ''}|${cell.bold ? 1 : 0}|${cell.dim ? 1 : 0}`
 
-/** The grid as one Text per row, each a run of Texts sharing a style. */
-export function elementsOf(Text: ClientElements['Text'], screen: Screen): RenderElement[] {
+/**
+ * The grid as one Text per row, each a run of Texts sharing a style. A row
+ * crossing the Image is a row Box instead, its gaps empty Boxes that draw
+ * nothing, so the picture beneath them stays.
+ */
+export function elementsOf({ Box, Text }: Pick<ClientElements, 'Box' | 'Text'>, screen: Screen): RenderElement[] {
   return screen.rows.map(cells => {
-    const runs: { style: Cell; text: string }[] = []
+    const runs: { style: Cell; text: string; width: number }[] = []
 
     for (const cell of cells) {
       const last = runs[runs.length - 1]
 
       if (last && styleKeyOf(last.style) === styleKeyOf(cell)) {
         last.text += cell.ch
+        last.width += 1
       } else {
-        runs.push({ style: cell, text: cell.ch })
+        runs.push({ style: cell, text: cell.ch, width: 1 })
       }
     }
 
-    return (
-      <Text>
-        {runs.map(({ style, text }) => (
-          <Text color={style.fg} backgroundColor={style.bg} bold={style.bold} dimColor={style.dim}>
-            {text}
-          </Text>
-        ))}
+    const textOf = ({ style, text }: { style: Cell; text: string }) => (
+      <Text color={style.fg} backgroundColor={style.bg} bold={style.bold} dimColor={style.dim}>
+        {text}
       </Text>
+    )
+
+    if (!runs.some(run => run.style.isImage)) {
+      return <Text>{runs.map(textOf)}</Text>
+    }
+
+    return (
+      <Box flexDirection="row" height={1}>
+        {runs.map(run => (run.style.isImage ? <Box width={run.width} height={1} flexShrink={0} /> : <Text wrap="truncate">{textOf(run)}</Text>))}
+      </Box>
     )
   })
 }

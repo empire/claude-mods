@@ -29,12 +29,12 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ./tictactoe
 
 Then run `/tictactoe`. The [tictactoe README](tictactoe/README.md) covers
 every control and explains how it's built: surface modules, a cell compositor
-so menus can overlap the game, and kitty Unicode placeholders that put an
-image inside Claude Code's text layout.
+so menus can overlap the game, and an `Image` element drawn beneath the board
+module's region.
 
 ## Developing
 
-`types/claude-code.d.ts` holds the Claude Code 2.1.273 plugin API declarations,
+`types/claude-code.d.ts` holds the Claude Code 2.1.278 plugin API declarations,
 and `tsconfig.json` typechecks every mod against them:
 
 ```sh

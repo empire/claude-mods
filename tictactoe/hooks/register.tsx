@@ -23,15 +23,22 @@ const HEADER_ROWS = 2
 /** The text board's full height; with fewer rows left, the band goes compact. */
 const FULL_BOARD_ROWS = 13
 
-/** The kitty board's height in rows: as tall as the band allows, within these. */
+/** The image board's height in rows: as tall as the band allows, within these. */
 const KITTY_MIN_ROWS = 4
 const KITTY_MAX_ROWS = 16
 
 /** Columns the scoreboard and the gap before it take beside the board. */
 const SCOREBOARD_COLUMNS = Scoreboard.WIDTH + 3
 
+/** The Image's key in the band's drawing, what `$.ui.blit` names, before its generation. */
+const IMAGE_KEY = 'ttt:image'
+
+/** What the image shows before the board has posted a frame. */
+const EMPTY_VIEW: View = { board: [...Game.EMPTY_BOARD], cursor: 4, placing: null, win: null, isDraw: false, isDimmed: false, overlay: null }
+
 type Renderer = 'auto' | 'kitty' | 'text'
 type Cells = { cellWidth: number; cellHeight: number }
+type Frame = { source: { rgba: string; width: number; height: number }; box: string }
 
 const isPost = (data: unknown): data is Post =>
   typeof data === 'object' && data !== null && (data as { kind?: unknown }).kind === 'sync'
@@ -44,6 +51,16 @@ const historyOf = (value: unknown): Result[] =>
     ? value.filter((item): item is Result => item === 'won' || item === 'lost' || item === 'draw').slice(-HISTORY_LIMIT)
     : []
 
+const boxKeyOf = (box: Kitty) => `${box.columns}x${box.rows}@${box.cellWidth}x${box.cellHeight}`
+
+/** Paints a view to fill the box, as the Image's source. */
+function frameOf(view: View, box: Kitty): Frame {
+  const canvas = canvasOf(box.columns, box.rows, box.cellWidth, box.cellHeight)
+  const rgba = Terminal.base64Of(paint(view, canvas))
+
+  return { source: { rgba, width: canvas.width, height: canvas.height }, box: boxKeyOf(box) }
+}
+
 /**
  * Registers `/tictactoe`: a board in the band above the prompt, where the
  * person plays X against Claude's O while Claude works.
@@ -52,8 +69,9 @@ const historyOf = (value: unknown): Result[] =>
  * body (menu bar, board, scoreboard, menus) and takes the mouse and keys.
  * This module mounts it, keeps the score, history and settings in the store,
  * does what its menus ask, and tells it when Claude finishes a turn. In a
- * terminal with the kitty graphics protocol it also paints each frame the
- * board posts and uploads it as an image (see `./kitty/terminal.ts`).
+ * terminal with the kitty graphics protocol it also draws the board as an
+ * `Image` beneath the surface module's region (which a surface module cannot
+ * draw), paints each frame the board posts, and swaps it in with `$.ui.blit`.
  *
  * @param on the engine's registrar
  */
@@ -69,18 +87,26 @@ export function register(on: On) {
   /** The board's last event applied; a board mounted fresh numbers its events from 1 again. */
   let ack = 0
 
-  /** The terminal's cell size in pixels, once probed; null where kitty mode is off. */
+  /** The terminal's cell size in pixels, once probed; null where the image board is off. */
   let cells: Cells | null = null
   let kitty: Kitty | null = null
-  const imageId = Terminal.newImageId()
 
-  /** The latest frame waiting to upload, and whether an upload is running. */
-  let pendingView: View | null = null
-  let isUploading = false
+  /** The band's site, for `$.ui.blit`; the latest view the board posted, and its painted frame. */
+  let siteId: string | null = null
+  let lastView: View = EMPTY_VIEW
+  let frame: Frame | null = null
+  /**
+   * Bumped when an open menu's box changes (it opens, closes, switches or grows). A blit swaps
+   * the pixels but leaves the Image's cells alone, so cells a menu drew over would keep its
+   * text once uncovered; a new key mounts the Image again and draws every one of its cells.
+   */
+  let imageGeneration = 0
+  const imageKey = () => `${IMAGE_KEY}:${imageGeneration}`
+  let isBlitting = false
+  let isBlitPending = false
 
-  /** Paints and uploads frames one at a time; frames that arrive meanwhile collapse into the latest. */
-  let pumpUploads: () => Promise<void> = async () => undefined
-  let deleteImage: () => Promise<void> = async () => undefined
+  /** Swaps the latest frame into the mounted Image, one blit at a time; frames meanwhile collapse. */
+  let pumpBlits: () => Promise<void> = async () => undefined
   /** Decides between the image and the text board for `renderer`, measuring the terminal. */
   let setUpRenderer: () => Promise<void> = async () => undefined
 
@@ -101,44 +127,38 @@ export function register(on: On) {
     difficulty = storedDifficulty === 'easy' ? 'easy' : 'hard'
     renderer = rendererOf(storedRenderer)
 
-    deleteImage = async () => {
-      if (cells) {
-        await $.process
-          .run(['python3', '-c', 'import sys; open("/dev/tty", "w").write(sys.argv[1])', Terminal.deleteImage(imageId)])
-          .catch(() => undefined)
-      }
-    }
-
-    pumpUploads = async () => {
-      if (isUploading) {
+    pumpBlits = async () => {
+      if (isBlitting) {
         return
       }
 
-      isUploading = true
+      isBlitting = true
 
       try {
-        while (pendingView && kitty) {
-          const view = pendingView
-          const box = kitty
-          pendingView = null
+        while (isBlitPending && kitty && siteId) {
+          isBlitPending = false
+          frame = frameOf(lastView, kitty)
 
-          const canvas = canvasOf(box.columns, box.rows, box.cellWidth, box.cellHeight)
-          const rgba = paint(view, canvas)
-          const argv = [String(canvas.width), String(canvas.height), String(box.id), String(box.columns), String(box.rows)]
+          const result = await $.ui
+            .blit({ requestId: siteId, key: imageKey(), source: frame.source })
+            .catch((error: unknown) => ({ deny: String(error) }))
 
-          const upload = await $.process
-            .run(['python3', '-c', Terminal.UPLOAD_PY, ...argv], { stdin: Terminal.base64Of(rgba) })
-            .catch((error: unknown) => ({ exitCode: -1, stderr: String(error) }))
+          if (result.deny === undefined) {
+            continue
+          }
 
-          if (upload.exitCode !== 0) {
-            $.ui.log(`tictactoe: kitty upload failed, back to text: ${upload.stderr.trim().slice(0, 200)}`)
+          if (/\balt\b/.test(result.deny)) {
+            // The terminal cannot show the picture after all: the text board, which it can.
+            $.ui.log(`tictactoe: no image here, back to text: ${result.deny.slice(0, 200)}`)
             cells = null
             kitty = null
-            $.ui.invalidate('ui.render')
           }
+
+          // Not mounted yet, or another size: the next render draws the latest frame.
+          $.ui.invalidate('ui.render')
         }
       } finally {
-        isUploading = false
+        isBlitting = false
       }
     }
 
@@ -190,7 +210,6 @@ export function register(on: On) {
     if (arg === 'stop' || (arg === '' && isOpen)) {
       isOpen = false
       $.ui.invalidate('ui.render')
-      await deleteImage()
 
       return { text: 'Tic-tac-toe closed' }
     }
@@ -199,6 +218,8 @@ export function register(on: On) {
 
     isOpen = true
     ack = 0
+    lastView = EMPTY_VIEW
+    frame = null
     $.ui.invalidate('ui.render')
 
     const how = cells ? 'kitty graphics' : renderer === 'text' ? 'text' : 'text (no kitty graphics here)'
@@ -227,8 +248,17 @@ export function register(on: On) {
     const { view, events } = e.data
 
     if (view) {
-      pendingView = view
-      void pumpUploads()
+      const isOverlayMoved = view.overlay !== lastView.overlay
+
+      lastView = view
+      isBlitPending = true
+
+      if (isOverlayMoved) {
+        imageGeneration += 1
+        $.ui.invalidate('ui.render')
+      }
+
+      void pumpBlits()
     }
 
     if (events.length === 0) {
@@ -266,16 +296,12 @@ export function register(on: On) {
           await $.store.set(DIFFICULTY_KEY, difficulty).catch(() => undefined)
           break
         case 'set-image-board': {
-          // Image to text frees the image. Text to image goes back to automatic detection, and
-          // stays on text with a note where the terminal cannot show images.
+          // Text to image goes back to automatic detection, and stays on text with a note where
+          // the terminal cannot show images.
           const wasImage = cells !== null
 
           if (event.isImage === wasImage) {
             break
-          }
-
-          if (wasImage) {
-            await deleteImage()
           }
 
           renderer = event.isImage ? 'auto' : 'text'
@@ -291,7 +317,6 @@ export function register(on: On) {
         }
         case 'close':
           isOpen = false
-          await deleteImage()
           break
       }
     }
@@ -307,8 +332,10 @@ export function register(on: On) {
       return next(e)
     }
 
-    const { Box, Client } = await $.ui.resolve(e)
+    const { Box, Client, Image } = await $.ui.resolve(e)
     const boardRows = e.props.maxRows - HEADER_ROWS
+
+    siteId = e.requestId
 
     columns = e.props.bodyColumns
     compact = boardRows < FULL_BOARD_ROWS
@@ -317,19 +344,41 @@ export function register(on: On) {
       // A square board: as many rows as the band spares, as many columns as make it square,
       // fewer rows when the band is too narrow for that beside the scoreboard.
       const room = Math.max(10, columns - SCOREBOARD_COLUMNS)
-      const byHeight = Math.min(KITTY_MAX_ROWS, Terminal.MAX_CELLS, Math.max(KITTY_MIN_ROWS, boardRows))
+      const byHeight = Math.min(KITTY_MAX_ROWS, Math.max(KITTY_MIN_ROWS, boardRows))
       const byWidth = Math.floor((room * cells.cellWidth) / cells.cellHeight)
       const rows = Math.max(3, Math.min(byHeight, byWidth))
       const cols = Math.max(3, Math.round((rows * cells.cellHeight) / cells.cellWidth))
 
-      kitty = { id: imageId, columns: cols, rows, ...cells }
+      kitty = { columns: cols, rows, ...cells }
     } else {
       kitty = null
     }
 
+    // The picture sits under the board's region, where the board leaves its cells undrawn;
+    // painted after it, a menu the board opens covers it.
+    const board = <Client key="ttt:board" module="./board.tsx" width={columns} props={boardProps()} />
+
+    if (!kitty) {
+      return (
+        <Box flexDirection="column">
+          {board}
+          {await next(e)}
+        </Box>
+      )
+    }
+
+    if (!frame || frame.box !== boxKeyOf(kitty)) {
+      frame = frameOf(lastView, kitty)
+    }
+
     return (
       <Box flexDirection="column">
-        <Client key="ttt:board" module="./board.tsx" width={columns} props={boardProps()} />
+        <Box flexDirection="column">
+          <Box position="absolute" top={HEADER_ROWS} left={0}>
+            <Image key={imageKey()} source={frame.source} columns={kitty.columns} rows={kitty.rows} alt="tic-tac-toe board" />
+          </Box>
+          {board}
+        </Box>
         {await next(e)}
       </Box>
     )

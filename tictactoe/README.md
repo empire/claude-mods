@@ -50,10 +50,10 @@ or for every session, in `~/.claude/settings.json`:
 
 Requirements:
 
-- Claude Code 2.1.273 or later, in an interactive terminal that reports the
+- Claude Code 2.1.278 or later, in an interactive terminal that reports the
   mouse.
 - For the image board: Ghostty or kitty (not inside tmux), and `python3`,
-  which writes the image to the terminal.
+  which reads the terminal's cell size in pixels.
 
 ## Play
 
@@ -81,37 +81,37 @@ asks first, with Cancel selected by default.
 
 | file | role |
 | --- | --- |
-| `hooks/register.tsx` | Hooks module. Registers `/tictactoe`, mounts the board in `ui.render` of `AbovePrompt`, stores the score, history and settings, carries out menu actions, and paints and uploads image frames |
+| `hooks/register.tsx` | Hooks module. Registers `/tictactoe`, mounts the board in `ui.render` of `AbovePrompt`, stores the score, history and settings, carries out menu actions, and draws the image board as an `Image`, swapping in each painted frame |
 | `hooks/board.tsx` | Surface module, mounted with `<Client module="./board.tsx">`. Owns the game, the pointer and keys, and composes the whole band body |
-| `hooks/ui/screen.tsx` | A cell grid drawn layer over layer and then turned into Text, which is how the menu can cover the board |
+| `hooks/ui/screen.tsx` | A cell grid drawn layer over layer and then turned into Text, which is how the menu can cover the board; image cells stay undrawn gaps |
 | `hooks/ui/menus.ts` | The menu bar, the dropdowns, and hit-testing for both |
 | `hooks/ui/scoreboard.ts` | The scoreboard and its compact version |
 | `hooks/ui/text-board.ts` | The box-drawing board |
 | `hooks/ui/theme.ts` | The shared palette |
 | `hooks/game.ts` | Game rules and Claude's move choice, with no engine calls |
 | `hooks/kitty/paint.ts` | Paints a frame as RGBA pixels: antialiased shapes built from distance functions, with gradients and glow |
-| `hooks/kitty/terminal.ts` | The kitty protocol parts: the python helpers, placeholder rows, image ids |
+| `hooks/kitty/terminal.ts` | The python helper that reads the cell size in pixels, and base64 for the image source |
 
 ### The image board
 
-Claude Code's renderer never passes escape sequences through, so the image
-reaches the terminal by another route, using kitty's
-[Unicode placeholders](https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders):
+Claude Code's `Image` element draws the picture: with the kitty graphics
+protocol in kitty and Ghostty, and its `alt` text elsewhere. A surface module
+can't draw an `Image`, so the two modules share the job:
 
 1. When the board opens, a python helper reads the terminal's cell size in
    pixels from `/dev/tty`. The image is then sized to match its cell box
    exactly, so pointer positions map straight onto board cells.
-2. Whenever the board's look changes, `board.tsx` posts a `View` (board,
-   cursor, animation progress). `register.tsx` paints it and pipes it to a
-   python helper, which zlib-compresses it and writes one `a=T,U=1` upload to
-   `/dev/tty`. Uploads run one at a time, and frames that arrive in the
-   meantime collapse into the latest.
-3. `board.tsx` draws the image's cell box as text: `U+10EEEE` placeholder
-   cells whose foreground color is the image id, each with diacritics naming
-   its row and column. Because every cell names its own position, an open
-   menu can replace some of them with its text, and the rest of the image
-   still lines up. The cells are ordinary text, so the image moves with the
-   layout and disappears when the board closes. Closing also frees the image.
+2. `register.tsx` draws the band as an `Image`, placed with
+   `position: "absolute"` two rows down, followed by the board's `Client`.
+   `board.tsx` leaves the board's cells as gaps (empty Boxes), so the picture
+   shows through them. An open menu replaces some of those gaps with its text,
+   and because it paints after the picture, it covers the picture.
+3. Whenever the board's look changes, `board.tsx` posts a `View` (board,
+   cursor, animation progress). `register.tsx` paints it as RGBA and swaps it
+   into the mounted `Image` with `$.ui.blit`, with no redraw. Blits run one at
+   a time, and frames that arrive in the meantime collapse into the latest.
+   If the terminal turns out to draw the `alt` in place of the picture, the
+   board falls back to text.
 
 ### Messages between the modules
 

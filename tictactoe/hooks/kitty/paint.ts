@@ -15,6 +15,11 @@ export type View = {
   isDraw: boolean
   /** Shaded dark while a menu is open over the board. */
   isDimmed: boolean
+  /**
+   * Where an open menu covers the board's region (its dropdown's box), null
+   * with none: a change means cells over the picture were drawn or uncovered.
+   */
+  overlay: string | null
 }
 
 /** The image's size in pixels and where the square board sits inside it. */
